@@ -29,8 +29,18 @@ else
 end
 local tcp = socket.tcp
 
+local amqp = {
+    connection_state = c.state.CLOSED,
+    channel_state = c.state.CLOSED,
 
-local amqp = {}
+    major = c.PROTOCOL_VERSION_MAJOR,
+    minor = c.PROTOCOL_VERSION_MINOR,
+    revision = c.PROTOCOL_VERSION_REVISION,
+
+    frame_max = c.DEFAULT_FRAME_SIZE,
+    channel_max = c.DEFAULT_MAX_CHANNELS,
+    mechanism = c.MECHANISM_PLAIN
+}
 local mt = { __index = amqp }
 
 -- to check whether we have valid parameters to setup
@@ -66,17 +76,7 @@ function amqp.new(opts)
    end
    
    return setmetatable( { sock = sock,
-                          opts = opts,
-                          connection_state = c.state.CLOSED,
-                          channel_state = c.state.CLOSED,
-
-                          major = c.PROTOCOL_VERSION_MAJOR,
-                          minor = c.PROTOCOL_VERSION_MINOR,
-                          revision = c.PROTOCOL_VERSION_REVISION,
-
-                          frame_max = c.DEFAULT_FRAME_SIZE,
-                          channel_max = c.DEFAULT_MAX_CHANNELS,
-                          mechanism = c.MECHANISM_PLAIN
+                          opts = opts
                         }, mt)
 end
 
@@ -269,8 +269,7 @@ local function channel_open(ctx)
 end
 
 local function channel_close(ctx, reason)
-   
-   local f = frame.new_method_frame(c.DEFAULT_CHANNEL,
+   local f = frame.new_method_frame(ctx.channel or 1,
                                      c.class.CHANNEL,
                                      c.method.channel.CLOSE)
 
@@ -405,11 +404,13 @@ function amqp:teardown(reason)
       local ok, err = channel_close(self,reason)
       if not ok then
          logger.error("[channel_close] err: ",err)
+         return err
       end
    elseif self.channel_state == c.state.CLOSE_WAIT then
       local ok, err = channel_close_ok(self)
       if not ok then
          logger.error("[channel_close_ok] err: ",err)
+         return err
       end
          
    end
@@ -418,14 +419,16 @@ function amqp:teardown(reason)
       local ok, err = connection_close(self,reason)
       if not ok then
          logger.error("[connection_close] err: ",err)
+         return err
       end
    elseif self.connection_state == c.state.CLOSE_WAIT then
       local ok, err = connection_close_ok(self)
       if not ok then
          logger.error("[connection_close_ok] err: ",err)
+         return err
       end
    end
-
+   return true
 end
 
 --
@@ -621,6 +624,48 @@ function amqp:consume()
 end
 
 --
+-- get
+--
+function amqp:get()
+    local ok, err = self:setup()
+    if not ok then
+      self:teardown()
+      return nil, err
+    end
+    
+    if self.channel_state ~= c.state.ESTABLISHED then
+      self:teardown()
+      return nil, err
+    end
+
+    local res, err = amqp.basic_get(self)
+    if not res then
+      logger.error("[amqp:get] basic_get failed: " .. err)
+      return nil, err
+    end
+    
+    local message
+    if res.method_id == c.method.basic.GET_OK and res.method.message_count > 0 then
+      local f, err0 = frame.consume_frame(self)
+      if f.type == c.frame.HEADER_FRAME then
+        logger.dbg(format("[header] class_id: %d weight: %d, body_size: %d",
+                          f.class_id, f.weight, f.body_size))
+        logger.dbg("[frame.properties]",f.properties)
+      end
+
+      local f, err0 = frame.consume_frame(self)
+      if f.type == c.frame.BODY_FRAME then
+        message = f.body
+      end
+      logger.dbg("[message]", message)
+    end
+
+    self:teardown()
+
+    return message, err
+end
+
+--
 -- publisher
 --
 
@@ -673,9 +718,9 @@ function amqp:queue_declare(opts)
    f.method = {
       queue = opts.queue or self.opts.queue,
       passive = default(opts.passive, false),
-      durable = default(opts.durable, false),
+      durable = default(opts.durable or self.opts.durable, false),
       exclusive = default(opts.exclusive, false),
-      auto_delete = default(opts.auto_delete, true),
+      auto_delete = default(opts.auto_delete or self.opts.auto_delete, true),
       no_wait = default(opts.no_wait, true)
    }
    return frame.wire_method_frame(self,f)
@@ -696,7 +741,7 @@ function amqp:queue_bind(opts)
    f.method = {
       queue = opts.queue or self.opts.queue,
       exchange = opts.exchange or self.opts.exchange,
-      routing_key = opts.routing_key or "",
+      routing_key = opts.routing_key or self.opts.routing_key or "",
       no_wait = default(opts.no_wait, false)
    }
 
@@ -764,8 +809,8 @@ function amqp:exchange_declare(opts)
       exchange = opts.exchange or self.opts.exchange,
       typ = opts.typ or "topic",
       passive = default(opts.passive, false),
-      durable = default(opts.durable, false),
-      auto_delete = default(opts.auto_delete, false),
+      durable = default(opts.durable or self.opts.durable, false),
+      auto_delete = default(opts.auto_delete or self.opts.auto_delete, false),
       internal = default(opts.internal, false),
       no_wait = default(opts.no_wait, false)
    }
@@ -894,6 +939,25 @@ function amqp:basic_publish(opts)
       return nil,"[basic_publish]" .. err
    end
    return bytes
+end
+
+function amqp:basic_get(opts)
+
+   opts = opts or {}
+
+   if not opts.queue and not self.opts.queue then
+      return nil, "[basic_get] queue is not specified."
+   end
+
+   local f = frame.new_method_frame(self.channel or 1,
+                                     c.class.BASIC,
+                                     c.method.basic.GET)
+
+   f.method = {
+      queue = opts.queue or self.opts.queue,
+      no_ack = default(opts.no_ack, true)
+   }
+   return frame.wire_method_frame(self,f)
 end
 
 return amqp
