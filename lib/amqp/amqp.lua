@@ -57,9 +57,9 @@ local function mandatory_options(opts)
       error("as a consumer, queue is required.")
    end
 
-   --if not opts.exchange then
-   --   error("no exchange configured.")
-   --end
+   if not opts.exchange then
+     error("no exchange configured.")
+   end
    
 end
 
@@ -92,7 +92,7 @@ local function sslhandshake(ctx)
    end
 
    local ssl = require("ssl")
-   local params = {
+   local params = ctx.opts.ssl_params or {
       mode = "client",
       protocol = "sslv23",
       verify = "none",
